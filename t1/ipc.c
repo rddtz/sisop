@@ -47,6 +47,8 @@ struct Pool {
     PoolEntry *entries; /* array de entradas          */
 };
 
+
+
 /* =========================================================================
  * pool_create
  * ========================================================================= */
@@ -97,41 +99,48 @@ int pool_active(const Pool *pool)
 void launch_worker(Pool *pool, const RenderParams *params, const Tile *t)
 {
 
-
   int fd[2] = {0};
 
-  /* if (pipe(fd) == -1) { */
-  /*   /\* perror("pipe"); *\/ */
-  /*   return; */
-  /* } */
+  if (pipe(fd) == -1) {
+    perror("pipe");
+    return;
+  }
 
-  pipe(fd);
   pid_t pid = fork();
 
-  /* if (pid < 0) { */
-  /*   perror("fork"); */
-  /*   close(fd[0]); */
-  /*   close(fd[1]); */
-  /*   return; */
-  /* } */
+  if (pid < 0) {
+    perror("fork");
+    close(fd[0]);
+    close(fd[1]);
+    return;
+  }
 
   if (pid > 0) { // pai
-
     close(fd[1]);
-
     for(int i = 0; i < pool->max; i++){
 
       if(pool->entries[i].pid == -1 && pool->entries[i].read_fd == -1){
 
-	pool->entries[i].pid = pid;
-	pool->entries[i].read_fd = fd[0];
-	pool->active++;
-	break;
-      }
+        pool->entries[i].pid = pid;
+        pool->entries[i].read_fd = fd[0];
+        pool->active++;
+        break;
 
+      }
     }
 
-  } else {
+    /* FILE *fptr; */
+    /* fptr = fopen("log.txt", "a"); */
+
+    /* fprintf(fptr, "Creating new process, pool is like:\n"); */
+
+    /* for(int i = 0; i < pool->max; i++){ */
+
+    /*   fprintf(fptr, "%d -> {%d, %d}\n", i, pool->entries[i].pid, pool->entries[i].read_fd); */
+    /* } */
+    /* fclose(fptr); */
+
+  } else { // filho
     close(fd[0]);
     worker_main(params, t, fd[1]);
   }
@@ -155,15 +164,23 @@ void worker_main(const RenderParams *params, const Tile *tile, int write_fd)
 
   compute_tile(params, tile, buf);
 
-  int writen = 0;
-  /* do{ */
-  writen += write(write_fd, tile, sizeof(Tile)); // Escrever cabeçalho: ox, oy, w, h
-  /* } while (writted < sizeof(Tile)); */
+  /* FILE *fptr; */
 
-  writen = 0;
-  /* do{ */
-  writen += write(write_fd, buf, sizeof(char) * tile->h * tile->w);
-  /* } while (writted < sizeof(buf)); */
+  /* fptr = fopen("log.txt", "a"); */
+  /* fprintf(fptr, "Computed for: w = %d, h = %d, ox = %d, oy = %d\n", tile->w, tile->h, tile->ox, tile->oy); */
+
+  size_t written = 0;
+  do{
+    written += write(write_fd, tile, sizeof(int) * 4);
+  } while (written < sizeof(int) * 4);
+
+  written = 0;
+  do{
+    written += write(write_fd, buf, sizeof(char) * tile->h * tile->w);
+  } while (written < sizeof(char) * tile->h * tile->w);
+
+  /* fprintf(fptr, "Sended\n"); */
+  /* fclose(fptr); */
 
   close(write_fd);
   free(buf);
@@ -178,7 +195,6 @@ void worker_main(const RenderParams *params, const Tile *tile, int write_fd)
  * ========================================================================= */
 int pool_collect_ready(Pool *pool, TileResult *result)
 {
-
     if (pool->active == 0) return 0;
 
     fd_set rfds;
@@ -186,33 +202,59 @@ int pool_collect_ready(Pool *pool, TileResult *result)
     int maxfd = -1;
     for (int i = 0; i < pool->max; i++) {
       if (pool->entries[i].pid != -1) {
-	FD_SET(pool->entries[i].read_fd, &rfds);
-	if (pool->entries[i].read_fd > maxfd)
-	  maxfd = pool->entries[i].read_fd;
+        FD_SET(pool->entries[i].read_fd, &rfds);
+        if (pool->entries[i].read_fd > maxfd){
+          maxfd = pool->entries[i].read_fd;
+        }
       }
     }
+
 
     struct timeval tv = {0, 0}; // timeout zero = não bloqueia
     int ready = select(maxfd + 1, &rfds, NULL, NULL, &tv);
     if (ready <= 0) return 0;
 
-    Tile *tile_result = malloc(sizeof(int) * 4);
-    // Para cada entrada com dados:
-    read(ready, tile_result, sizeof(Tile));    //   ler cabeçalho (4 ints: ox, oy, w, h)
 
-    result->tile.h = tile_result->h;
-    result->tile.w = tile_result->w;
-    result->tile.ox = tile_result->ox;
-    result->tile.oy = tile_result->oy;
+    for(int i = 0; i < pool->max; i++ ){
+      if(pool->entries[i].read_fd != -1 && FD_ISSET(pool->entries[i].read_fd, &rfds)) {
 
-    result->pixels = malloc(sizeof(char) * result->tile.h * result->tile.w);     //   alocar result->pixels com malloc(w  h)
+	/* char NAME[100] = {0}; */
+	/* sprintf(NAME, "file-for-%d.txt", i); */
 
-    int readed = 0;
-    /* do{ */
-    readed += read(ready, result->pixels, sizeof(char) * result->tile.h * result->tile.w);
-    /* } while (readed < sizeof(char) * result->tile.h * result->tile.w); */
+	/* FILE *fptr; */
 
-    return 1;
+	/* fptr = fopen(NAME, "a"); //"log.txt", "a"); */
+	/* fprintf(fptr, "Reading from %d\n", i); */
+
+	int readden = 0;
+	do{
+	  readden += read(pool->entries[i].read_fd, &result->tile, sizeof(int) * 4); //ler cabeçalho (4 ints: ox, oy, w, h)
+	} while (readden < sizeof(int) * 4);
+
+	/* result->tile = tile_result; */
+	result->pixels = malloc(sizeof(char) * result->tile.h * result->tile.w); //alocar result->pixels com malloc(w  h)
+
+
+	readden = 0;
+        do{
+	  readden += read(pool->entries[i].read_fd, result->pixels, sizeof(char) * result->tile.h * result->tile.w);
+	} while (readden < sizeof(char) * result->tile.h * result->tile.w);
+
+	/* /\* fptr = fopen("log.txt", "a"); *\/ */
+	/* fprintf(fptr, "Data successfully read from %d\n", i); */
+	/* fprintf(fptr, "Readed: w = %d, h = %d, ox = %d, oy = %d\n", result->tile.w, result->tile.h, result->tile.ox, result->tile.oy); */
+
+
+	/* fclose(fptr); */
+
+        close(pool->entries[i].read_fd);
+	pool->entries[i].read_fd = -1;
+
+	return 1;
+      }
+    }
+
+    return 0;
 }
 
 /* =========================================================================
@@ -222,21 +264,37 @@ int pool_collect_ready(Pool *pool, TileResult *result)
  * ========================================================================= */
 void pool_reap(Pool *pool)
 {
-
   int status;
   pid_t pid;
+
   while ((pid = waitpid(-1, &status, WNOHANG)) > 0) {
 
-    for(int i = 0; i < pool->max; i++){
+    /* FILE *fptr; */
 
+    /* fptr = fopen("log.txt", "a"); */
+
+    /* fprintf(fptr, "Trying to collect from pid %d with status %d\n", pid, status); */
+    /* fprintf(fptr, "pool is like:\n"); */
+
+    /* for(int i = 0; i < pool->max; i++){ */
+    /*   fprintf(fptr, "%d -> {%d, %d}\n", i, pool->entries[i].pid, pool->entries[i].read_fd); */
+    /* } */
+
+    /* // Close the file */
+    /* fclose(fptr); */
+
+    for(int i = 0; i < pool->max; i++){
       if(pool->entries[i].pid == pid){
 
-	close(pool->entries[i].read_fd);
-	pool->entries[i].pid = -1;
-	pool->entries[i].read_fd = -1;
-	pool->active--;
+        pool->entries[i].pid = -1;
 
+        close(pool->entries[i].read_fd);
+        pool->entries[i].read_fd = -1;
+
+        pool->active--;
       }
+
     }
   }
+
 }
