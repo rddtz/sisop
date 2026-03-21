@@ -201,7 +201,7 @@ int pool_collect_ready(Pool *pool, TileResult *result)
     FD_ZERO(&rfds);
     int maxfd = -1;
     for (int i = 0; i < pool->max; i++) {
-      if (pool->entries[i].pid != -1) {
+      if (pool->entries[i].pid != -1 && pool->entries[i].read_fd != -1) {
         FD_SET(pool->entries[i].read_fd, &rfds);
         if (pool->entries[i].read_fd > maxfd){
           maxfd = pool->entries[i].read_fd;
