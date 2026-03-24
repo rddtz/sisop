@@ -226,7 +226,7 @@ int pool_collect_ready(Pool *pool, TileResult *result)
 	/* fptr = fopen(NAME, "a"); //"log.txt", "a"); */
 	/* fprintf(fptr, "Reading from %d\n", i); */
 
-	int readden = 0;
+	  size_t readden = 0;
 	do{
 	  readden += read(pool->entries[i].read_fd, &result->tile, sizeof(int) * 4); //ler cabeçalho (4 ints: ox, oy, w, h)
 	} while (readden < sizeof(int) * 4);
