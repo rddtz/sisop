@@ -35,6 +35,18 @@
 #include <pthread.h>
 #include <semaphore.h>
 
+pthread_mutex_t m_ctx;
+
+pthread_mutex_t m_buffer_radio;
+pthread_mutex_t m_buffer_ftl;
+
+sem_t sem_empty_radio;
+sem_t sem_full_radio;
+
+sem_t sem_empty_ftl;
+sem_t sem_full_ftl;
+
+
 /* =========================================================================
  * Estruturas de dados
  * ========================================================================= */
@@ -64,6 +76,7 @@ typedef struct {
   int    in;              /* índice de inserção                       */
   int    out;             /* índice de remoção                        */
   int    count;           /* elementos atualmente no buffer           */
+
 } Buffer;
 
 /* Contexto global compartilhado entre todas as threads */
@@ -113,7 +126,7 @@ double gerar_temperatura(void)
 
 double gerar_pressao(void)
 {
-  // ignore eventuais problemas de geração de números aleatórios em multi-threaded  
+  // ignore eventuais problemas de geração de números aleatórios em multi-threaded
   double r = (double)rand() / RAND_MAX;
   if (r < 0.05)
     return 80.0 + (double)rand() / RAND_MAX * 20.0;
@@ -192,12 +205,21 @@ static void *orion(void *arg)
     /* Delay de transmissão via rádio (1-3 ms) */
     usleep((1 + meu_id % 3) * 1000);
 
+    sem_wait(&sem_empty_radio);
+    pthread_mutex_lock(&m_buffer_radio);
+
     buffer_inserir(&ctx->buf_orion_lua, &p);
 
+    pthread_mutex_unlock(&m_buffer_radio);
+    sem_post(&sem_full_radio);
+
+    pthread_mutex_lock(&m_ctx);
     ctx->total_enviados++;
 
     printf("[Orion %ld] seq=%d enviado | total=%ld\n",
 	   meu_id, seq, ctx->total_enviados);
+    pthread_mutex_unlock(&m_ctx);
+
   }
   return NULL;
 }
@@ -218,7 +240,14 @@ static void *relay(void *arg)
   for (int i = 0; i < total_esperado; i++) {
 
     Pacote p;
+
+    sem_wait(&sem_full_radio);
+    pthread_mutex_lock(&m_buffer_radio);
+
     buffer_remover(&ctx->buf_orion_lua, &p);
+
+    pthread_mutex_unlock(&m_buffer_radio);
+    sem_post(&sem_empty_radio);
 
     /* Processamento: calcula checksum e timestamp */
     PacoteRelay pr;
@@ -236,7 +265,14 @@ static void *relay(void *arg)
     /* Delay FTL simulado (muito menor que rádio) */
     usleep(20);
 
+    sem_wait(&sem_empty_ftl);
+    pthread_mutex_lock(&m_buffer_ftl);
+
     buffer_inserir(&ctx->buf_lua_terra, &pr);
+
+    pthread_mutex_unlock(&m_buffer_ftl);
+    sem_post(&sem_full_ftl);
+
 
     ctx->total_relay++;
   }
@@ -258,7 +294,15 @@ static void *terra(void *arg)
   for (int i = 0; i < total_esperado; i++) {
 
     PacoteRelay pr;
+
+    sem_wait(&sem_full_ftl);
+    pthread_mutex_lock(&m_buffer_ftl);
+
     buffer_remover(&ctx->buf_lua_terra, &pr);
+
+    pthread_mutex_unlock(&m_buffer_ftl);
+    sem_post(&sem_empty_ftl);
+
 
     /* Validação de integridade */
     unsigned int cs = calcular_checksum(&pr.original);
@@ -279,8 +323,10 @@ static void *terra(void *arg)
   printf("  Pacotes recebidos : %ld\n",  ctx->total_recebidos);
   printf("  Alertas recebidos : %d\n",   alertas);
   printf("  Erros de checksum : %d\n",   erros_checksum);
+  pthread_mutex_lock(&m_ctx);
   printf("  Enviados vs recebidos: %ld vs %ld\n",
 	 ctx->total_enviados, ctx->total_recebidos);
+  pthread_mutex_unlock(&m_ctx);
 
   return NULL;
 }
@@ -301,6 +347,12 @@ int main(int argc, char *argv[])
   int buf_orion_lua  = atoi(argv[2]);
   int buf_lua_terra  = atoi(argv[3]);
   int n_pacotes      = atoi(argv[4]);
+
+  sem_init(&sem_empty_radio, 0, buf_orion_lua);
+  sem_init(&sem_full_radio, 0, 0);
+
+  sem_init(&sem_empty_ftl, 0, buf_lua_terra);
+  sem_init(&sem_full_ftl, 0, 0);
 
   if (n_orions < 1 || buf_orion_lua < 1 ||
       buf_lua_terra < 1 || n_pacotes < 1) {
