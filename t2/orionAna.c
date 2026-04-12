@@ -294,9 +294,7 @@ static void *relay(void *arg)
       sem_post(&ctx->buf_lua_terra.alertas_prioritarios);
     } else {
       sem_post(&ctx->buf_lua_terra.alertas_normais);
-    }
-    sem_post(&ctx->buf_lua_terra.full);
-    
+    }    
 
     pthread_mutex_lock(&mutex_total_relay);
     ctx->total_relay++;
@@ -320,7 +318,10 @@ static void *terra(void *arg)
   for (int i = 0; i < total_esperado; i++) {
 
     PacoteRelay pr;
-    sem_wait(&ctx->buf_lua_terra.full);
+    if (sem_trywait(&ctx->buf_lua_terra.alertas_prioritarios) == 0) {
+    } else {
+        sem_wait(&ctx->buf_lua_terra.alertas_normais);
+    }
 
     pthread_mutex_lock(&ctx->buf_lua_terra.mutex);
     buffer_remover(&ctx->buf_lua_terra, &pr);
