@@ -227,7 +227,7 @@ static int lru_evict(Memory *m, Process procs[], int n_procs, Metrics *met)
 {
 
 
-  int last_used = n_procs*100;
+  int last_used = 10000;
   int frame_id = 0;
   int lru_pid = 0;
   int lru_page_id = 0;
@@ -237,11 +237,19 @@ static int lru_evict(Memory *m, Process procs[], int n_procs, Metrics *met)
     if(!m->frames[i].free){
       int pid = m->frames[i].owner_pid;
       int page_id = m->frames[i].owner_page;
+      int proc_index = -1;
 
-      if(procs[pid].pt.entries[page_id].last_used < last_used){
-	last_used = procs[pid].pt.entries[page_id].last_used;
+      for(int pr = 0; pr < n_procs; pr++){
+	if(procs[pr].pid == pid){
+	  proc_index = pr;
+	}
+      }
+
+
+      if(procs[proc_index].pt.entries[page_id].last_used < last_used){
+	last_used = procs[proc_index].pt.entries[page_id].last_used;
 	frame_id = i;
-	lru_pid = pid;
+	lru_pid = proc_index;
 	lru_page_id = page_id;
       }
     }
@@ -304,6 +312,7 @@ static int alloc_paged(Memory *m, Process *p, Process procs[],
     p->pt.entries[page].valid = 1;
     p->pt.entries[page].frame = free_frame;
     p->pt.entries[page].last_used = m->clock;
+    p->pt.n_pages++;
 
     m->frames[free_frame].owner_page = page;
     m->frames[free_frame].owner_pid = p->pid;
