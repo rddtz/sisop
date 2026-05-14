@@ -259,6 +259,21 @@ static int alloc_paged(Memory *m, Process *p, Process procs[],
  */
 static void free_paged(Memory *m, Process *p)
 {
+    for (int i = 0; i < MAX_PAGES; i++) {
+        if (p->pt.entries[i].valid) {
+            int indice_frame = p->pt.entries[i].frame;
+
+            if (indice_frame >= 0 && indice_frame < N_FRAMES) {
+                m->frames[indice_frame].free = 1;
+                m->frames[indice_frame].owner_pid = -1;
+                m->frames[indice_frame].owner_page = -1;
+            }
+
+            p->pt.entries[i].valid = 0;
+            p->pt.entries[i].frame = -1;
+            p->pt.entries[i].last_used = 0;
+        }
+    }
 }
 
 /* =========================================================================
