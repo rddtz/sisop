@@ -245,7 +245,6 @@ static int lru_evict(Memory *m, Process procs[], int n_procs, Metrics *met)
 	}
       }
 
-
       if(procs[proc_index].pt.entries[page_id].last_used < last_used){
 	last_used = procs[proc_index].pt.entries[page_id].last_used;
 	frame_id = i;
@@ -283,11 +282,12 @@ static int alloc_paged(Memory *m, Process *p, Process procs[],
                        int n_procs, Metrics *met)
 {
 
+  met->total_allocs++;
   int n_pages = (p->size + PAGE_SIZE - 1) / PAGE_SIZE;
   for(int proc = 0; proc < n_pages; proc++){
 
     int i = 0;
-    while(i < N_FRAMES && !m->frames[i].free)
+    while(i < N_FRAMES && !m->frames[i].free){
       i++;
     }
 
@@ -309,14 +309,11 @@ static int alloc_paged(Memory *m, Process *p, Process procs[],
     p->pt.entries[proc].last_used = m->clock;
     p->pt.n_pages++;
 
-    m->frames[free_frame].owner_page = page;
+    m->frames[free_frame].owner_page = proc;
     m->frames[free_frame].owner_pid = p->pid;
     m->frames[free_frame].free = 0;
-
-    met->total_allocs++;
-    met->internal_frag += n_pages * PAGE_SIZE - p->size.
   }
-
+  met->internal_frag += n_pages * PAGE_SIZE - p->size;
 
   return 0;
 
