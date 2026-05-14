@@ -225,6 +225,33 @@ static void free_contiguous(Memory *m, Process *p)
  */
 static int lru_evict(Memory *m, Process procs[], int n_procs, Metrics *met)
 {
+
+  int last_used = 1000000000000000;
+  int frame_id = 0;
+  int lru_pid = 0;
+  int lru_page_id = 0;
+
+  for (int i = 0; i < N_FRAMES; i++) {
+
+    if(!m->frames[i].free){
+      int pid = m->frames[i].owner_pid;
+      int page_id = m->frames[i].owner_page;
+
+      if(procs[pid]->pt.entries[page_id].last_used < last_used){
+	last_used = procs[pid]->pt.entries[page_id].last_used;
+	frame_id = i;
+	lru_pid = pid;
+	lru_page_id = page_id;
+      }
+    }
+  }
+
+  free_paged(m, procs[pid]);
+  m->frames[frame_id].free = 1;
+  m->frames[frame_id].owner_pid = -1;
+  m->clock = 0;
+
+  return frame_id;
 }
 
 /*
@@ -243,6 +270,9 @@ static int lru_evict(Memory *m, Process procs[], int n_procs, Metrics *met)
  *
  * TODO: implemente esta função.
  */
+
+
+
 static int alloc_paged(Memory *m, Process *p, Process procs[],
                        int n_procs, Metrics *met)
 {
@@ -557,4 +587,3 @@ int main(int argc, char *argv[])
     }
     return 0;
 }
-
