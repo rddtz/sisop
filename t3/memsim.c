@@ -225,6 +225,35 @@ static void free_contiguous(Memory *m, Process *p)
  */
 static int lru_evict(Memory *m, Process procs[], int n_procs, Metrics *met)
 {
+
+
+  int last_used = n_procs*100;
+  int frame_id = 0;
+  int lru_pid = 0;
+  int lru_page_id = 0;
+
+  for (int i = 0; i < N_FRAMES; i++) {
+
+    if(!m->frames[i].free){
+      int pid = m->frames[i].owner_pid;
+      int page_id = m->frames[i].owner_page;
+
+      if(procs[pid].pt.entries[page_id].last_used < last_used){
+	last_used = procs[pid].pt.entries[page_id].last_used;
+	frame_id = i;
+	lru_pid = pid;
+	lru_page_id = page_id;
+      }
+    }
+  }
+
+  met->evictions++;
+  procs[lru_pid].pt.entries[lru_page_id].valid = 0;
+  m->frames[frame_id].free = 1;
+  m->frames[frame_id].owner_pid = -1;
+  m->clock = 0;
+
+  return frame_id;
 }
 
 /*
@@ -297,6 +326,21 @@ static int alloc_paged(Memory *m, Process *p, Process procs[],
  */
 static void free_paged(Memory *m, Process *p)
 {
+    for (int i = 0; i < MAX_PAGES; i++) {
+        if (p->pt.entries[i].valid) {
+            int indice_frame = p->pt.entries[i].frame;
+
+            if (indice_frame >= 0 && indice_frame < N_FRAMES) {
+                m->frames[indice_frame].free = 1;
+                m->frames[indice_frame].owner_pid = -1;
+                m->frames[indice_frame].owner_page = -1;
+            }
+
+            p->pt.entries[i].valid = 0;
+            p->pt.entries[i].frame = -1;
+            p->pt.entries[i].last_used = 0;
+        }
+    }
 }
 
 /* =========================================================================
@@ -595,3 +639,4 @@ int main(int argc, char *argv[])
     }
     return 0;
 }
+
