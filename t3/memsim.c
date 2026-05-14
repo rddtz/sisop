@@ -276,9 +276,7 @@ static int alloc_paged(Memory *m, Process *p, Process procs[],
                        int n_procs, Metrics *met)
 {
 
-  for(int proc = 0; proc < p.size / PAGE_SIZE; proc++){
-
-    int has_free = 0;
+  for(int proc = 0; proc < p->size / PAGE_SIZE; proc++){
 
     int i = 0;
     while(!m->frames[i].free && i < N_FRAMES){
@@ -288,7 +286,7 @@ static int alloc_paged(Memory *m, Process *p, Process procs[],
     int free_frame = -1;
 
     if(i == N_FRAMES){
-      int free_frame = lru_evict(m, procs, n_procs, met);
+      free_frame = lru_evict(m, procs, n_procs, met);
       met->page_faults++;
     } else if (i >= 0){
       free_frame = i;
@@ -299,16 +297,16 @@ static int alloc_paged(Memory *m, Process *p, Process procs[],
     }
 
     int page = 0;
-    while(!p[proc].pt.entires[page].valid){
+    while(!p[proc].pt.entries[page].valid){
       page++;
     }
 
-    p[proc].pt.entires[page].valid = 1;
-    p[proc].pt.entires[page].frame = free_frame;
-    p[proc].pt.entires[page].last_used = m->clock;
+    p->pt.entries[page].valid = 1;
+    p->pt.entries[page].frame = free_frame;
+    p->pt.entries[page].last_used = m->clock;
 
     m->frames[free_frame].owner_page = page;
-    m->frames[free_frame].owner_pid = p.pid;
+    m->frames[free_frame].owner_pid = p->pid;
   }
 
   return 0;
@@ -639,4 +637,3 @@ int main(int argc, char *argv[])
     }
     return 0;
 }
-
