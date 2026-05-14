@@ -295,6 +295,17 @@ static void free_paged(Memory *m, Process *p)
  */
 static int translate(Memory *m, Process *p, int logical, Metrics *met)
 {
+    int num_pagina = logical / PAGE_SIZE;
+    int offset = logical % PAGE_SIZE;
+
+    if (logical < 0 || num_pagina >= MAX_PAGES || !p->pt.entries[num_pagina].valid) {
+        ++(met->page_faults);
+        return -1;
+    }
+
+    p->pt.entries[num_pagina].last_used = m->clock;
+    int indice_frame = p->pt.entries[num_pagina].frame;
+    return indice_frame * PAGE_SIZE + offset;
 }
 
 /* =========================================================================
