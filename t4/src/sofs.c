@@ -28,7 +28,8 @@ static int g_mounted = false;
 static struct sofs_superbloco g_superbloco;
 static unsigned int g_superbloco_sector;   /* setor absoluto do superbloco */
 
-#define SOFS_OPEN_FILE_MAX 16
+#define SOFS_OPEN_FILE_MAX 10
+#define MAX_LINK_DEPTH     8
 
 struct sofs_open_file {
     int in_use;
@@ -37,6 +38,9 @@ struct sofs_open_file {
 };
 
 static struct sofs_open_file g_open_files[SOFS_OPEN_FILE_MAX];
+
+static int          g_dir_open   = false;
+static unsigned int g_dir_cursor = 0;
 
 /* -------------------------------------------------------------------------
  * Auxiliar: lê o MBR e localiza a partição <partition>.
@@ -302,6 +306,66 @@ static int set_directory_entry(const char *name, unsigned int inode_num,
     return -1;
 }
 
+/*
+ * free_all_blocks - frees every data block and every index block reachable
+ * from the given in-memory inode, then zeroes all block pointer fields.
+ */
+static void free_all_blocks(struct sofs_inode *inode)
+{
+    unsigned int block_size;
+    unsigned int ppb;
+    unsigned int *ind_buf;
+    unsigned int i, j;
+
+    if (inode == NULL)
+        return;
+
+    block_size = g_superbloco.blockSize * SECTOR_SIZE;
+    ppb = block_size / sizeof(DWORD);
+
+    if (inode->dataPtr[0] != 0) {
+        free_data_block(inode->dataPtr[0]);
+        inode->dataPtr[0] = 0;
+    }
+    if (inode->dataPtr[1] != 0) {
+        free_data_block(inode->dataPtr[1]);
+        inode->dataPtr[1] = 0;
+    }
+
+    if (inode->singleIndPtr != 0) {
+        ind_buf = (unsigned int *)__builtin_alloca(block_size);
+        if (read_block(inode->singleIndPtr, (unsigned char *)ind_buf) == 0) {
+            for (i = 0; i < ppb; i++) {
+                if (ind_buf[i] != 0)
+                    free_data_block(ind_buf[i]);
+            }
+        }
+        free_data_block(inode->singleIndPtr);
+        inode->singleIndPtr = 0;
+    }
+
+    if (inode->doubleIndPtr != 0) {
+        unsigned int *outer_buf = (unsigned int *)__builtin_alloca(block_size);
+        unsigned int *inner_buf = (unsigned int *)__builtin_alloca(block_size);
+        if (read_block(inode->doubleIndPtr, (unsigned char *)outer_buf) == 0) {
+            for (i = 0; i < ppb; i++) {
+                if (outer_buf[i] != 0) {
+                    if (read_block(outer_buf[i],
+                                   (unsigned char *)inner_buf) == 0) {
+                        for (j = 0; j < ppb; j++) {
+                            if (inner_buf[j] != 0)
+                                free_data_block(inner_buf[j]);
+                        }
+                    }
+                    free_data_block(outer_buf[i]);
+                }
+            }
+        }
+        free_data_block(inode->doubleIndPtr);
+        inode->doubleIndPtr = 0;
+    }
+}
+
 static int truncate_inode(unsigned int inode_num)
 {
     unsigned int block_size;
@@ -328,16 +392,7 @@ static int truncate_inode(unsigned int inode_num)
 
     inode = (struct sofs_inode *)(buf + inode_offset * sizeof(struct sofs_inode));
 
-    if (inode->dataPtr[0] != 0) {
-        free_data_block(inode->dataPtr[0]);
-        inode->dataPtr[0] = 0;
-    }
-    if (inode->dataPtr[1] != 0) {
-        free_data_block(inode->dataPtr[1]);
-        inode->dataPtr[1] = 0;
-    }
-    inode->singleIndPtr = 0;
-    inode->doubleIndPtr = 0;
+    free_all_blocks(inode);
     inode->blocksFileSize = 0;
     inode->bytesFileSize = 0;
     inode->RefCounter = 1;
@@ -402,6 +457,158 @@ static int write_inode(unsigned int inode_num, const struct sofs_inode *inode)
     return write_block(inode_block, buf);
 }
 
+/*
+ * map_block - maps a logical block index to a physical (absolute) block number.
+ *
+ *   inode         : in-memory inode (may be updated when allocate == 1)
+ *   logical_index : zero-based logical block number within the file
+ *   allocate      : 1 = allocate missing blocks; 0 = read-only lookup
+ *   phys          : receives the physical block number (0 = hole / unallocated)
+ *
+ * Block layout:
+ *   0..1                        direct (dataPtr[0], dataPtr[1])
+ *   2..2+ppb-1                  single indirect (singleIndPtr)
+ *   2+ppb..2+ppb+ppb*ppb-1     double indirect (doubleIndPtr)
+ *
+ * Returns 0 on success, -1 on error or capacity exceeded.
+ * When allocate == 1 the caller must write_inode() after map_block() returns.
+ */
+static int map_block(struct sofs_inode *inode, DWORD logical_index,
+                     int allocate, unsigned int *phys)
+{
+    unsigned int block_size;
+    unsigned int ppb;
+    int new_block;
+
+    if (inode == NULL || phys == NULL)
+        return -1;
+
+    block_size = g_superbloco.blockSize * SECTOR_SIZE;
+    ppb = block_size / sizeof(DWORD);
+
+    /* --- direct blocks --- */
+    if (logical_index < 2) {
+        if (inode->dataPtr[logical_index] == 0) {
+            if (!allocate) {
+                *phys = 0;
+                return 0;
+            }
+            new_block = alloc_data_block();
+            if (new_block < 0)
+                return -1;
+            inode->dataPtr[logical_index] = (DWORD)new_block;
+        }
+        *phys = inode->dataPtr[logical_index];
+        return 0;
+    }
+    logical_index -= 2;
+
+    /* --- single indirect --- */
+    if (logical_index < ppb) {
+        unsigned int *ind_buf = (unsigned int *)__builtin_alloca(block_size);
+
+        if (inode->singleIndPtr == 0) {
+            if (!allocate) {
+                *phys = 0;
+                return 0;
+            }
+            new_block = alloc_data_block();
+            if (new_block < 0)
+                return -1;
+            inode->singleIndPtr = (DWORD)new_block;
+            memset(ind_buf, 0, block_size);
+        } else {
+            if (read_block(inode->singleIndPtr,
+                           (unsigned char *)ind_buf) != 0)
+                return -1;
+        }
+
+        if (ind_buf[logical_index] == 0) {
+            if (!allocate) {
+                *phys = 0;
+                return 0;
+            }
+            new_block = alloc_data_block();
+            if (new_block < 0)
+                return -1;
+            ind_buf[logical_index] = (DWORD)new_block;
+            if (write_block(inode->singleIndPtr,
+                            (unsigned char *)ind_buf) != 0)
+                return -1;
+        }
+
+        *phys = ind_buf[logical_index];
+        return 0;
+    }
+    logical_index -= ppb;
+
+    /* --- double indirect --- */
+    if (logical_index < ppb * ppb) {
+        unsigned int outer = logical_index / ppb;
+        unsigned int inner = logical_index % ppb;
+        unsigned int *outer_buf = (unsigned int *)__builtin_alloca(block_size);
+        unsigned int *inner_buf = (unsigned int *)__builtin_alloca(block_size);
+        unsigned int single_ind_block;
+
+        if (inode->doubleIndPtr == 0) {
+            if (!allocate) {
+                *phys = 0;
+                return 0;
+            }
+            new_block = alloc_data_block();
+            if (new_block < 0)
+                return -1;
+            inode->doubleIndPtr = (DWORD)new_block;
+            memset(outer_buf, 0, block_size);
+        } else {
+            if (read_block(inode->doubleIndPtr,
+                           (unsigned char *)outer_buf) != 0)
+                return -1;
+        }
+
+        if (outer_buf[outer] == 0) {
+            if (!allocate) {
+                *phys = 0;
+                return 0;
+            }
+            new_block = alloc_data_block();
+            if (new_block < 0)
+                return -1;
+            outer_buf[outer] = (DWORD)new_block;
+            if (write_block(inode->doubleIndPtr,
+                            (unsigned char *)outer_buf) != 0)
+                return -1;
+            memset(inner_buf, 0, block_size);
+        } else {
+            if (read_block(outer_buf[outer],
+                           (unsigned char *)inner_buf) != 0)
+                return -1;
+        }
+
+        single_ind_block = outer_buf[outer];
+
+        if (inner_buf[inner] == 0) {
+            if (!allocate) {
+                *phys = 0;
+                return 0;
+            }
+            new_block = alloc_data_block();
+            if (new_block < 0)
+                return -1;
+            inner_buf[inner] = (DWORD)new_block;
+            if (write_block(single_ind_block,
+                            (unsigned char *)inner_buf) != 0)
+                return -1;
+        }
+
+        *phys = inner_buf[inner];
+        return 0;
+    }
+
+    /* beyond max addressable capacity */
+    return -1;
+}
+
 static int invalidate_directory_entry(const char *name)
 {
     unsigned int block_size;
@@ -449,7 +656,8 @@ static int find_free_handle(void)
 
 int sofs_identify(char *name, int size)
 {
-    const char *id = "TODO implementation";
+    /* TODO: substituir pelos nomes e cartoes dos integrantes do grupo */
+    const char *id = "PREENCHER NOMES E CARTOES DO GRUPO";
     if (name == NULL || size <= 0)
         return -1;
     strncpy(name, id, size - 1);
@@ -640,18 +848,21 @@ int sofs_delete(char *name)
     if (read_inode(inode_num, &inode) != 0)
         return -1;
 
-    if (inode.dataPtr[0] != 0)
-        free_data_block(inode.dataPtr[0]);
-    if (inode.dataPtr[1] != 0)
-        free_data_block(inode.dataPtr[1]);
+    if (inode.RefCounter > 1) {
+        /* other hardlinks still reference this inode; just decrement */
+        inode.RefCounter--;
+        if (write_inode(inode_num, &inode) != 0)
+            return -1;
+        return invalidate_directory_entry(name);
+    }
+
+    /* last reference: release all blocks and the inode itself */
+    free_all_blocks(&inode);
 
     if (free_inode(inode_num) != 0)
         return -1;
 
-    if (invalidate_directory_entry(name) != 0)
-        return -1;
-
-    return 0;
+    return invalidate_directory_entry(name);
 }
 
 SOFS_FILE sofs_open(char *name)
@@ -659,12 +870,48 @@ SOFS_FILE sofs_open(char *name)
     unsigned int inode_num;
     int handle;
     int index;
+    int depth;
+    char curname[SOFS_MAX_FILE_NAME_SIZE + 2];
+    unsigned int block_size;
+    unsigned char *buf;
+    unsigned char *buf2;
+    struct sofs_record *records;
+    struct sofs_inode inode;
 
     if (!g_mounted || name == NULL || name[0] == '\0')
         return -1;
 
-    if (find_directory_entry(name, &inode_num, &index) != 0)
-        return -1;
+    strncpy(curname, name, SOFS_MAX_FILE_NAME_SIZE);
+    curname[SOFS_MAX_FILE_NAME_SIZE] = '\0';
+
+    block_size = g_superbloco.blockSize * SECTOR_SIZE;
+    buf  = (unsigned char *)__builtin_alloca(block_size);
+    buf2 = (unsigned char *)__builtin_alloca(block_size);
+
+    for (depth = 0; depth < MAX_LINK_DEPTH; depth++) {
+        if (find_directory_entry(curname, &inode_num, &index) != 0)
+            return -1;
+
+        if (read_block(get_root_dir_block(), buf) != 0)
+            return -1;
+
+        records = (struct sofs_record *)buf;
+        if (records[index].TypeVal != TYPEVAL_LINK)
+            break;
+
+        /* follow the soft link: read target name from data block */
+        if (read_inode(inode_num, &inode) != 0)
+            return -1;
+
+        if (read_block(inode.dataPtr[0], buf2) != 0)
+            return -1;
+
+        strncpy(curname, (char *)buf2, SOFS_MAX_FILE_NAME_SIZE);
+        curname[SOFS_MAX_FILE_NAME_SIZE] = '\0';
+    }
+
+    if (depth == MAX_LINK_DEPTH)
+        return -1;  /* cycle or depth exceeded */
 
     handle = find_free_handle();
     if (handle < 0)
@@ -698,6 +945,7 @@ int sofs_read(SOFS_FILE handle, char *buffer, int size)
     struct sofs_inode inode;
     DWORD bytes_read = 0;
     DWORD block_size;
+    unsigned char *block_buf;
 
     if (handle <= 0 || buffer == NULL || size <= 0)
         return -1;
@@ -710,6 +958,8 @@ int sofs_read(SOFS_FILE handle, char *buffer, int size)
         return -1;
 
     block_size = g_superbloco.blockSize * SECTOR_SIZE;
+    block_buf = (unsigned char *)__builtin_alloca(block_size);
+
     while (size > 0) {
         DWORD block_index = file->position / block_size;
         DWORD block_offset = file->position % block_size;
@@ -717,16 +967,13 @@ int sofs_read(SOFS_FILE handle, char *buffer, int size)
             ? inode.bytesFileSize - file->position
             : 0;
         DWORD bytes_to_copy;
-        unsigned char block_buf[SECTOR_SIZE * 2];
         unsigned int abs_block;
 
         if (bytes_left_in_file == 0)
             break;
 
-        if (block_index >= 2)
+        if (map_block(&inode, block_index, 0, &abs_block) != 0)
             break;
-
-        abs_block = inode.dataPtr[block_index];
         if (abs_block == 0)
             break;
 
@@ -754,6 +1001,7 @@ int sofs_write(SOFS_FILE handle, char *buffer, int size)
     struct sofs_inode inode;
     DWORD bytes_written = 0;
     DWORD block_size;
+    unsigned char *block_buf;
 
     if (handle <= 0 || buffer == NULL || size <= 0)
         return -1;
@@ -766,34 +1014,26 @@ int sofs_write(SOFS_FILE handle, char *buffer, int size)
         return -1;
 
     block_size = g_superbloco.blockSize * SECTOR_SIZE;
+    block_buf = (unsigned char *)__builtin_alloca(block_size);
+
     while (size > 0) {
         DWORD block_index = file->position / block_size;
         DWORD block_offset = file->position % block_size;
         DWORD bytes_to_write;
-        unsigned char block_buf[SECTOR_SIZE * 2];
-        int abs_block;
+        unsigned int abs_block;
 
-        if (block_index >= 2)
-            break;
+        if (map_block(&inode, block_index, 1, &abs_block) != 0)
+            break;  /* disk full or capacity exceeded */
 
-        if (inode.dataPtr[block_index] == 0) {
-            abs_block = alloc_data_block();
-            if (abs_block < 0)
-                break;
-            inode.dataPtr[block_index] = (DWORD)abs_block;
-            memset(block_buf, 0, block_size);
-        } else {
-            abs_block = (int)inode.dataPtr[block_index];
-            if (read_block((unsigned int)abs_block, block_buf) != 0)
-                return -1;
-        }
+        if (read_block(abs_block, block_buf) != 0)
+            return -1;
 
         bytes_to_write = (DWORD)size;
         if (bytes_to_write > block_size - block_offset)
             bytes_to_write = block_size - block_offset;
 
         memcpy(block_buf + block_offset, buffer + bytes_written, bytes_to_write);
-        if (write_block((unsigned int)abs_block, block_buf) != 0)
+        if (write_block(abs_block, block_buf) != 0)
             return -1;
 
         file->position += bytes_to_write;
@@ -818,23 +1058,54 @@ int sofs_write(SOFS_FILE handle, char *buffer, int size)
 
 int sofs_opendir(void)
 {
-    /* TODO: verifica que uma partição está montada, posiciona o ponteiro de
-     * entradas no primeiro registro válido do diretório raiz e retorna 0. */
-    return -1;
+    if (!g_mounted)
+        return -1;
+    g_dir_cursor = 0;
+    g_dir_open   = 1;
+    return 0;
 }
 
 int sofs_readdir(SOFS_DIRENT *dentry)
 {
-    /* TODO: lê o próximo registro válido do diretório em *dentry e avança o
-     * ponteiro de entradas. Retorna valor diferente de zero ao fim do diretório. */
-    (void)dentry;
-    return -1;
+    unsigned int block_size;
+    unsigned int entries_per_block;
+    unsigned char *buf;
+    struct sofs_record *records;
+    struct sofs_inode inode;
+    unsigned int i;
+
+    if (!g_mounted || !g_dir_open || dentry == NULL)
+        return -1;
+
+    block_size = g_superbloco.blockSize * SECTOR_SIZE;
+    entries_per_block = block_size / sizeof(struct sofs_record);
+    buf = (unsigned char *)__builtin_alloca(block_size);
+    if (read_block(get_root_dir_block(), buf) != 0)
+        return -1;
+
+    records = (struct sofs_record *)buf;
+    for (i = g_dir_cursor; i < entries_per_block; i++) {
+        if (records[i].TypeVal != TYPEVAL_INVALIDO) {
+            strncpy(dentry->name, records[i].name, SOFS_MAX_FILE_NAME_SIZE);
+            dentry->name[SOFS_MAX_FILE_NAME_SIZE] = '\0';
+            dentry->fileType = records[i].TypeVal;
+            if (read_inode(records[i].inodeNumber, &inode) == 0)
+                dentry->fileSize = inode.bytesFileSize;
+            else
+                dentry->fileSize = 0;
+            g_dir_cursor = i + 1;
+            return 0;
+        }
+    }
+
+    return 1; /* end of directory */
 }
 
 int sofs_closedir(void)
 {
-    /* TODO: reinicia o ponteiro de entradas do diretório e retorna 0. */
-    return -1;
+    g_dir_cursor = 0;
+    g_dir_open   = 0;
+    return 0;
 }
 
 /* -------------------------------------------------------------------------
@@ -843,18 +1114,108 @@ int sofs_closedir(void)
 
 int sofs_sln(char *linkname, char *filename)
 {
-    /* TODO: cria um softlink chamado <linkname> cujo único bloco de dados
-     * contém a string <filename>. */
-    (void)linkname;
-    (void)filename;
-    return -1;
+    unsigned int inode_num;
+    int block;
+    struct sofs_inode inode;
+    unsigned int block_size;
+    unsigned char *buf;
+    int idx;
+
+    if (!g_mounted || linkname == NULL || filename == NULL)
+        return -1;
+    if (linkname[0] == '\0' || filename[0] == '\0')
+        return -1;
+    if (strlen(linkname) > SOFS_MAX_FILE_NAME_SIZE)
+        return -1;
+    if (strlen(filename) > SOFS_MAX_FILE_NAME_SIZE)
+        return -1;
+
+    if (find_directory_entry(linkname, &inode_num, &idx) == 0)
+        return -1;  /* linkname already exists */
+
+    inode_num = (unsigned int)alloc_inode();
+    if ((int)inode_num < 0)
+        return -1;
+
+    block = alloc_data_block();
+    if (block < 0) {
+        free_inode(inode_num);
+        return -1;
+    }
+
+    if (read_inode(inode_num, &inode) != 0) {
+        free_data_block((unsigned int)block);
+        free_inode(inode_num);
+        return -1;
+    }
+
+    inode.dataPtr[0]    = (DWORD)block;
+    inode.blocksFileSize = 1;
+    inode.bytesFileSize  = (DWORD)strlen(filename);
+    inode.RefCounter     = 1;
+
+    if (write_inode(inode_num, &inode) != 0) {
+        free_data_block((unsigned int)block);
+        free_inode(inode_num);
+        return -1;
+    }
+
+    block_size = g_superbloco.blockSize * SECTOR_SIZE;
+    buf = (unsigned char *)__builtin_alloca(block_size);
+    memset(buf, 0, block_size);
+    memcpy(buf, filename, strlen(filename));
+
+    if (write_block((unsigned int)block, buf) != 0) {
+        free_data_block((unsigned int)block);
+        free_inode(inode_num);
+        return -1;
+    }
+
+    if (set_directory_entry(linkname, inode_num, TYPEVAL_LINK, NULL) != 0) {
+        free_data_block((unsigned int)block);
+        free_inode(inode_num);
+        return -1;
+    }
+
+    return 0;
 }
 
 int sofs_hln(char *linkname, char *filename)
 {
-    /* TODO: cria um hardlink chamado <linkname> apontando para o mesmo
-     * i-node que <filename>; incrementa o campo RefCounter do i-node. */
-    (void)linkname;
-    (void)filename;
-    return -1;
+    unsigned int target_inode;
+    unsigned int tmp_inode;
+    struct sofs_inode inode;
+    int idx;
+
+    if (!g_mounted || linkname == NULL || filename == NULL)
+        return -1;
+    if (linkname[0] == '\0' || filename[0] == '\0')
+        return -1;
+    if (strlen(linkname) > SOFS_MAX_FILE_NAME_SIZE)
+        return -1;
+
+    if (find_directory_entry(linkname, &tmp_inode, &idx) == 0)
+        return -1;  /* linkname already exists */
+
+    if (find_directory_entry(filename, &target_inode, &idx) != 0)
+        return -1;  /* filename not found */
+
+    if (read_inode(target_inode, &inode) != 0)
+        return -1;
+
+    inode.RefCounter++;
+
+    if (write_inode(target_inode, &inode) != 0)
+        return -1;
+
+    if (set_directory_entry(linkname, target_inode, TYPEVAL_REGULAR, NULL) != 0) {
+        /* rollback RefCounter increment */
+        if (read_inode(target_inode, &inode) == 0) {
+            inode.RefCounter--;
+            write_inode(target_inode, &inode);
+        }
+        return -1;
+    }
+
+    return 0;
 }
