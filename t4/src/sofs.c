@@ -28,7 +28,7 @@ static int g_mounted = false;
 static struct sofs_superbloco g_superbloco;
 static unsigned int g_superbloco_sector;   /* setor absoluto do superbloco */
 
-#define SOFS_OPEN_FILE_MAX 16
+#define SOFS_OPEN_FILE_MAX 10
 
 struct sofs_open_file {
     int in_use;
@@ -302,6 +302,66 @@ static int set_directory_entry(const char *name, unsigned int inode_num,
     return -1;
 }
 
+/*
+ * free_all_blocks - frees every data block and every index block reachable
+ * from the given in-memory inode, then zeroes all block pointer fields.
+ */
+static void free_all_blocks(struct sofs_inode *inode)
+{
+    unsigned int block_size;
+    unsigned int ppb;
+    unsigned int *ind_buf;
+    unsigned int i, j;
+
+    if (inode == NULL)
+        return;
+
+    block_size = g_superbloco.blockSize * SECTOR_SIZE;
+    ppb = block_size / sizeof(DWORD);
+
+    if (inode->dataPtr[0] != 0) {
+        free_data_block(inode->dataPtr[0]);
+        inode->dataPtr[0] = 0;
+    }
+    if (inode->dataPtr[1] != 0) {
+        free_data_block(inode->dataPtr[1]);
+        inode->dataPtr[1] = 0;
+    }
+
+    if (inode->singleIndPtr != 0) {
+        ind_buf = (unsigned int *)__builtin_alloca(block_size);
+        if (read_block(inode->singleIndPtr, (unsigned char *)ind_buf) == 0) {
+            for (i = 0; i < ppb; i++) {
+                if (ind_buf[i] != 0)
+                    free_data_block(ind_buf[i]);
+            }
+        }
+        free_data_block(inode->singleIndPtr);
+        inode->singleIndPtr = 0;
+    }
+
+    if (inode->doubleIndPtr != 0) {
+        unsigned int *outer_buf = (unsigned int *)__builtin_alloca(block_size);
+        unsigned int *inner_buf = (unsigned int *)__builtin_alloca(block_size);
+        if (read_block(inode->doubleIndPtr, (unsigned char *)outer_buf) == 0) {
+            for (i = 0; i < ppb; i++) {
+                if (outer_buf[i] != 0) {
+                    if (read_block(outer_buf[i],
+                                   (unsigned char *)inner_buf) == 0) {
+                        for (j = 0; j < ppb; j++) {
+                            if (inner_buf[j] != 0)
+                                free_data_block(inner_buf[j]);
+                        }
+                    }
+                    free_data_block(outer_buf[i]);
+                }
+            }
+        }
+        free_data_block(inode->doubleIndPtr);
+        inode->doubleIndPtr = 0;
+    }
+}
+
 static int truncate_inode(unsigned int inode_num)
 {
     unsigned int block_size;
@@ -328,16 +388,7 @@ static int truncate_inode(unsigned int inode_num)
 
     inode = (struct sofs_inode *)(buf + inode_offset * sizeof(struct sofs_inode));
 
-    if (inode->dataPtr[0] != 0) {
-        free_data_block(inode->dataPtr[0]);
-        inode->dataPtr[0] = 0;
-    }
-    if (inode->dataPtr[1] != 0) {
-        free_data_block(inode->dataPtr[1]);
-        inode->dataPtr[1] = 0;
-    }
-    inode->singleIndPtr = 0;
-    inode->doubleIndPtr = 0;
+    free_all_blocks(inode);
     inode->blocksFileSize = 0;
     inode->bytesFileSize = 0;
     inode->RefCounter = 1;
@@ -400,6 +451,158 @@ static int write_inode(unsigned int inode_num, const struct sofs_inode *inode)
     memcpy(buf + inode_offset * sizeof(struct sofs_inode), inode,
            sizeof(struct sofs_inode));
     return write_block(inode_block, buf);
+}
+
+/*
+ * map_block - maps a logical block index to a physical (absolute) block number.
+ *
+ *   inode         : in-memory inode (may be updated when allocate == 1)
+ *   logical_index : zero-based logical block number within the file
+ *   allocate      : 1 = allocate missing blocks; 0 = read-only lookup
+ *   phys          : receives the physical block number (0 = hole / unallocated)
+ *
+ * Block layout:
+ *   0..1                        direct (dataPtr[0], dataPtr[1])
+ *   2..2+ppb-1                  single indirect (singleIndPtr)
+ *   2+ppb..2+ppb+ppb*ppb-1     double indirect (doubleIndPtr)
+ *
+ * Returns 0 on success, -1 on error or capacity exceeded.
+ * When allocate == 1 the caller must write_inode() after map_block() returns.
+ */
+static int map_block(struct sofs_inode *inode, DWORD logical_index,
+                     int allocate, unsigned int *phys)
+{
+    unsigned int block_size;
+    unsigned int ppb;
+    int new_block;
+
+    if (inode == NULL || phys == NULL)
+        return -1;
+
+    block_size = g_superbloco.blockSize * SECTOR_SIZE;
+    ppb = block_size / sizeof(DWORD);
+
+    /* --- direct blocks --- */
+    if (logical_index < 2) {
+        if (inode->dataPtr[logical_index] == 0) {
+            if (!allocate) {
+                *phys = 0;
+                return 0;
+            }
+            new_block = alloc_data_block();
+            if (new_block < 0)
+                return -1;
+            inode->dataPtr[logical_index] = (DWORD)new_block;
+        }
+        *phys = inode->dataPtr[logical_index];
+        return 0;
+    }
+    logical_index -= 2;
+
+    /* --- single indirect --- */
+    if (logical_index < ppb) {
+        unsigned int *ind_buf = (unsigned int *)__builtin_alloca(block_size);
+
+        if (inode->singleIndPtr == 0) {
+            if (!allocate) {
+                *phys = 0;
+                return 0;
+            }
+            new_block = alloc_data_block();
+            if (new_block < 0)
+                return -1;
+            inode->singleIndPtr = (DWORD)new_block;
+            memset(ind_buf, 0, block_size);
+        } else {
+            if (read_block(inode->singleIndPtr,
+                           (unsigned char *)ind_buf) != 0)
+                return -1;
+        }
+
+        if (ind_buf[logical_index] == 0) {
+            if (!allocate) {
+                *phys = 0;
+                return 0;
+            }
+            new_block = alloc_data_block();
+            if (new_block < 0)
+                return -1;
+            ind_buf[logical_index] = (DWORD)new_block;
+            if (write_block(inode->singleIndPtr,
+                            (unsigned char *)ind_buf) != 0)
+                return -1;
+        }
+
+        *phys = ind_buf[logical_index];
+        return 0;
+    }
+    logical_index -= ppb;
+
+    /* --- double indirect --- */
+    if (logical_index < ppb * ppb) {
+        unsigned int outer = logical_index / ppb;
+        unsigned int inner = logical_index % ppb;
+        unsigned int *outer_buf = (unsigned int *)__builtin_alloca(block_size);
+        unsigned int *inner_buf = (unsigned int *)__builtin_alloca(block_size);
+        unsigned int single_ind_block;
+
+        if (inode->doubleIndPtr == 0) {
+            if (!allocate) {
+                *phys = 0;
+                return 0;
+            }
+            new_block = alloc_data_block();
+            if (new_block < 0)
+                return -1;
+            inode->doubleIndPtr = (DWORD)new_block;
+            memset(outer_buf, 0, block_size);
+        } else {
+            if (read_block(inode->doubleIndPtr,
+                           (unsigned char *)outer_buf) != 0)
+                return -1;
+        }
+
+        if (outer_buf[outer] == 0) {
+            if (!allocate) {
+                *phys = 0;
+                return 0;
+            }
+            new_block = alloc_data_block();
+            if (new_block < 0)
+                return -1;
+            outer_buf[outer] = (DWORD)new_block;
+            if (write_block(inode->doubleIndPtr,
+                            (unsigned char *)outer_buf) != 0)
+                return -1;
+            memset(inner_buf, 0, block_size);
+        } else {
+            if (read_block(outer_buf[outer],
+                           (unsigned char *)inner_buf) != 0)
+                return -1;
+        }
+
+        single_ind_block = outer_buf[outer];
+
+        if (inner_buf[inner] == 0) {
+            if (!allocate) {
+                *phys = 0;
+                return 0;
+            }
+            new_block = alloc_data_block();
+            if (new_block < 0)
+                return -1;
+            inner_buf[inner] = (DWORD)new_block;
+            if (write_block(single_ind_block,
+                            (unsigned char *)inner_buf) != 0)
+                return -1;
+        }
+
+        *phys = inner_buf[inner];
+        return 0;
+    }
+
+    /* beyond max addressable capacity */
+    return -1;
 }
 
 static int invalidate_directory_entry(const char *name)
@@ -640,18 +843,21 @@ int sofs_delete(char *name)
     if (read_inode(inode_num, &inode) != 0)
         return -1;
 
-    if (inode.dataPtr[0] != 0)
-        free_data_block(inode.dataPtr[0]);
-    if (inode.dataPtr[1] != 0)
-        free_data_block(inode.dataPtr[1]);
+    if (inode.RefCounter > 1) {
+        /* other hardlinks still reference this inode; just decrement */
+        inode.RefCounter--;
+        if (write_inode(inode_num, &inode) != 0)
+            return -1;
+        return invalidate_directory_entry(name);
+    }
+
+    /* last reference: release all blocks and the inode itself */
+    free_all_blocks(&inode);
 
     if (free_inode(inode_num) != 0)
         return -1;
 
-    if (invalidate_directory_entry(name) != 0)
-        return -1;
-
-    return 0;
+    return invalidate_directory_entry(name);
 }
 
 SOFS_FILE sofs_open(char *name)
@@ -698,6 +904,7 @@ int sofs_read(SOFS_FILE handle, char *buffer, int size)
     struct sofs_inode inode;
     DWORD bytes_read = 0;
     DWORD block_size;
+    unsigned char *block_buf;
 
     if (handle <= 0 || buffer == NULL || size <= 0)
         return -1;
@@ -710,6 +917,8 @@ int sofs_read(SOFS_FILE handle, char *buffer, int size)
         return -1;
 
     block_size = g_superbloco.blockSize * SECTOR_SIZE;
+    block_buf = (unsigned char *)__builtin_alloca(block_size);
+
     while (size > 0) {
         DWORD block_index = file->position / block_size;
         DWORD block_offset = file->position % block_size;
@@ -717,16 +926,13 @@ int sofs_read(SOFS_FILE handle, char *buffer, int size)
             ? inode.bytesFileSize - file->position
             : 0;
         DWORD bytes_to_copy;
-        unsigned char block_buf[SECTOR_SIZE * 2];
         unsigned int abs_block;
 
         if (bytes_left_in_file == 0)
             break;
 
-        if (block_index >= 2)
+        if (map_block(&inode, block_index, 0, &abs_block) != 0)
             break;
-
-        abs_block = inode.dataPtr[block_index];
         if (abs_block == 0)
             break;
 
@@ -754,6 +960,7 @@ int sofs_write(SOFS_FILE handle, char *buffer, int size)
     struct sofs_inode inode;
     DWORD bytes_written = 0;
     DWORD block_size;
+    unsigned char *block_buf;
 
     if (handle <= 0 || buffer == NULL || size <= 0)
         return -1;
@@ -766,34 +973,26 @@ int sofs_write(SOFS_FILE handle, char *buffer, int size)
         return -1;
 
     block_size = g_superbloco.blockSize * SECTOR_SIZE;
+    block_buf = (unsigned char *)__builtin_alloca(block_size);
+
     while (size > 0) {
         DWORD block_index = file->position / block_size;
         DWORD block_offset = file->position % block_size;
         DWORD bytes_to_write;
-        unsigned char block_buf[SECTOR_SIZE * 2];
-        int abs_block;
+        unsigned int abs_block;
 
-        if (block_index >= 2)
-            break;
+        if (map_block(&inode, block_index, 1, &abs_block) != 0)
+            break;  /* disk full or capacity exceeded */
 
-        if (inode.dataPtr[block_index] == 0) {
-            abs_block = alloc_data_block();
-            if (abs_block < 0)
-                break;
-            inode.dataPtr[block_index] = (DWORD)abs_block;
-            memset(block_buf, 0, block_size);
-        } else {
-            abs_block = (int)inode.dataPtr[block_index];
-            if (read_block((unsigned int)abs_block, block_buf) != 0)
-                return -1;
-        }
+        if (read_block(abs_block, block_buf) != 0)
+            return -1;
 
         bytes_to_write = (DWORD)size;
         if (bytes_to_write > block_size - block_offset)
             bytes_to_write = block_size - block_offset;
 
         memcpy(block_buf + block_offset, buffer + bytes_written, bytes_to_write);
-        if (write_block((unsigned int)abs_block, block_buf) != 0)
+        if (write_block(abs_block, block_buf) != 0)
             return -1;
 
         file->position += bytes_to_write;
