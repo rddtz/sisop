@@ -29,6 +29,7 @@ static struct sofs_superbloco g_superbloco;
 static unsigned int g_superbloco_sector;   /* setor absoluto do superbloco */
 
 #define SOFS_OPEN_FILE_MAX 10
+#define MAX_LINK_DEPTH     8
 
 struct sofs_open_file {
     int in_use;
@@ -655,7 +656,8 @@ static int find_free_handle(void)
 
 int sofs_identify(char *name, int size)
 {
-    const char *id = "TODO implementation";
+    /* TODO: substituir pelos nomes e cartoes dos integrantes do grupo */
+    const char *id = "PREENCHER NOMES E CARTOES DO GRUPO";
     if (name == NULL || size <= 0)
         return -1;
     strncpy(name, id, size - 1);
@@ -868,12 +870,48 @@ SOFS_FILE sofs_open(char *name)
     unsigned int inode_num;
     int handle;
     int index;
+    int depth;
+    char curname[SOFS_MAX_FILE_NAME_SIZE + 2];
+    unsigned int block_size;
+    unsigned char *buf;
+    unsigned char *buf2;
+    struct sofs_record *records;
+    struct sofs_inode inode;
 
     if (!g_mounted || name == NULL || name[0] == '\0')
         return -1;
 
-    if (find_directory_entry(name, &inode_num, &index) != 0)
-        return -1;
+    strncpy(curname, name, SOFS_MAX_FILE_NAME_SIZE);
+    curname[SOFS_MAX_FILE_NAME_SIZE] = '\0';
+
+    block_size = g_superbloco.blockSize * SECTOR_SIZE;
+    buf  = (unsigned char *)__builtin_alloca(block_size);
+    buf2 = (unsigned char *)__builtin_alloca(block_size);
+
+    for (depth = 0; depth < MAX_LINK_DEPTH; depth++) {
+        if (find_directory_entry(curname, &inode_num, &index) != 0)
+            return -1;
+
+        if (read_block(get_root_dir_block(), buf) != 0)
+            return -1;
+
+        records = (struct sofs_record *)buf;
+        if (records[index].TypeVal != TYPEVAL_LINK)
+            break;
+
+        /* follow the soft link: read target name from data block */
+        if (read_inode(inode_num, &inode) != 0)
+            return -1;
+
+        if (read_block(inode.dataPtr[0], buf2) != 0)
+            return -1;
+
+        strncpy(curname, (char *)buf2, SOFS_MAX_FILE_NAME_SIZE);
+        curname[SOFS_MAX_FILE_NAME_SIZE] = '\0';
+    }
+
+    if (depth == MAX_LINK_DEPTH)
+        return -1;  /* cycle or depth exceeded */
 
     handle = find_free_handle();
     if (handle < 0)
@@ -1076,18 +1114,108 @@ int sofs_closedir(void)
 
 int sofs_sln(char *linkname, char *filename)
 {
-    /* TODO: cria um softlink chamado <linkname> cujo único bloco de dados
-     * contém a string <filename>. */
-    (void)linkname;
-    (void)filename;
-    return -1;
+    unsigned int inode_num;
+    int block;
+    struct sofs_inode inode;
+    unsigned int block_size;
+    unsigned char *buf;
+    int idx;
+
+    if (!g_mounted || linkname == NULL || filename == NULL)
+        return -1;
+    if (linkname[0] == '\0' || filename[0] == '\0')
+        return -1;
+    if (strlen(linkname) > SOFS_MAX_FILE_NAME_SIZE)
+        return -1;
+    if (strlen(filename) > SOFS_MAX_FILE_NAME_SIZE)
+        return -1;
+
+    if (find_directory_entry(linkname, &inode_num, &idx) == 0)
+        return -1;  /* linkname already exists */
+
+    inode_num = (unsigned int)alloc_inode();
+    if ((int)inode_num < 0)
+        return -1;
+
+    block = alloc_data_block();
+    if (block < 0) {
+        free_inode(inode_num);
+        return -1;
+    }
+
+    if (read_inode(inode_num, &inode) != 0) {
+        free_data_block((unsigned int)block);
+        free_inode(inode_num);
+        return -1;
+    }
+
+    inode.dataPtr[0]    = (DWORD)block;
+    inode.blocksFileSize = 1;
+    inode.bytesFileSize  = (DWORD)strlen(filename);
+    inode.RefCounter     = 1;
+
+    if (write_inode(inode_num, &inode) != 0) {
+        free_data_block((unsigned int)block);
+        free_inode(inode_num);
+        return -1;
+    }
+
+    block_size = g_superbloco.blockSize * SECTOR_SIZE;
+    buf = (unsigned char *)__builtin_alloca(block_size);
+    memset(buf, 0, block_size);
+    memcpy(buf, filename, strlen(filename));
+
+    if (write_block((unsigned int)block, buf) != 0) {
+        free_data_block((unsigned int)block);
+        free_inode(inode_num);
+        return -1;
+    }
+
+    if (set_directory_entry(linkname, inode_num, TYPEVAL_LINK, NULL) != 0) {
+        free_data_block((unsigned int)block);
+        free_inode(inode_num);
+        return -1;
+    }
+
+    return 0;
 }
 
 int sofs_hln(char *linkname, char *filename)
 {
-    /* TODO: cria um hardlink chamado <linkname> apontando para o mesmo
-     * i-node que <filename>; incrementa o campo RefCounter do i-node. */
-    (void)linkname;
-    (void)filename;
-    return -1;
+    unsigned int target_inode;
+    unsigned int tmp_inode;
+    struct sofs_inode inode;
+    int idx;
+
+    if (!g_mounted || linkname == NULL || filename == NULL)
+        return -1;
+    if (linkname[0] == '\0' || filename[0] == '\0')
+        return -1;
+    if (strlen(linkname) > SOFS_MAX_FILE_NAME_SIZE)
+        return -1;
+
+    if (find_directory_entry(linkname, &tmp_inode, &idx) == 0)
+        return -1;  /* linkname already exists */
+
+    if (find_directory_entry(filename, &target_inode, &idx) != 0)
+        return -1;  /* filename not found */
+
+    if (read_inode(target_inode, &inode) != 0)
+        return -1;
+
+    inode.RefCounter++;
+
+    if (write_inode(target_inode, &inode) != 0)
+        return -1;
+
+    if (set_directory_entry(linkname, target_inode, TYPEVAL_REGULAR, NULL) != 0) {
+        /* rollback RefCounter increment */
+        if (read_inode(target_inode, &inode) == 0) {
+            inode.RefCounter--;
+            write_inode(target_inode, &inode);
+        }
+        return -1;
+    }
+
+    return 0;
 }
