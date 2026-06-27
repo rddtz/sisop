@@ -1,0 +1,58 @@
+Grupo:
+Rayan Raddatz de Matos - 00584919
+Ana Luiza Colombi Sanfelice - 00577504
+
+O que foi feito
+
+Implementamos todas as funções pedidas:
+
+- Arquivos: sofs_create, sofs_delete, sofs_open, sofs_close, sofs_read e
+  sofs_write. A leitura e a escrita usam os dois ponteiros diretos, a indireção
+  simples e a indireção dupla, então dá pra ter arquivos grandes
+  (testamos com um arquivo de 100 KB).
+
+- Diretório: sofs_opendir, sofs_readdir e sofs_closedir, que percorrem as
+  entradas válidas do diretório raiz.
+
+- Links: sofs_sln (softlink) e sofs_hln (hardlink). O softlink guarda o nome do
+  alvo num bloco de dados; o hardlink aponta pro mesmo i-node e incrementa o
+  RefCounter.
+
+Preenchemos o sofs_identify com os dados do grupo.
+
+
+Algumas decisões
+
+- A escrita e a leitura usam uma função map_block, que converte o número lógico
+  do bloco no bloco real do disco e trata os casos direto / indireto simples /
+  indireto duplo num lugar só.
+
+- No sofs_delete a gente respeita o RefCounter: se o i-node ainda tem outros
+  nomes apontando pra ele (hardlink), só tira a entrada do diretório e diminui o
+  contador. Os blocos e o i-node só são liberados quando some o último
+  nome (última referência).
+
+- No sofs_open, se a entrada for um softlink, lemos o nome do alvo e procuramos
+  de novo no diretório. Como um link pode apontar pra outro, isso é feito num
+  laço, com um limite de 8 saltos pra não entrar em loop caso os links formem um
+  ciclo. Vimos que o Linux usa a mesma ideia de limitar a quantidade de links seguidos
+  com o erro ELOOP.
+
+- O diretório raiz fica num bloco fixo, do jeito que o sofs_format (que já vinha
+  pronto e não podíamos alterar) deixou montado.
+
+
+Como compilar e testar
+
+  make           gera a lib
+  make exemplo   compila o exemplo, depois rodar ./bin/exemplo
+  make run-test  compila e roda nossos testes
+
+O test_sofs.c tem nossos testes, incluindo os casos mais chatos: arquivo
+grande com indireção, escrita que cruza a fronteira dos blocos, limite de
+arquivos abertos, softlink quebrado e o hardlink continuando válido depois de
+apagar o nome original.
+
+Vale lembrar que tanto o exemplo quanto os testes formatam a partição 0, ou
+seja, apagam o t2fs_disk.dat. Dá pra copiar o disco antes se quiser
+guardar algo.
