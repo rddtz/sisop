@@ -38,6 +38,9 @@ struct sofs_open_file {
 
 static struct sofs_open_file g_open_files[SOFS_OPEN_FILE_MAX];
 
+static int          g_dir_open   = false;
+static unsigned int g_dir_cursor = 0;
+
 /* -------------------------------------------------------------------------
  * Auxiliar: lê o MBR e localiza a partição <partition>.
  * Preenche *first_sector e *num_sectors.
@@ -818,23 +821,54 @@ int sofs_write(SOFS_FILE handle, char *buffer, int size)
 
 int sofs_opendir(void)
 {
-    /* TODO: verifica que uma partição está montada, posiciona o ponteiro de
-     * entradas no primeiro registro válido do diretório raiz e retorna 0. */
-    return -1;
+    if (!g_mounted)
+        return -1;
+    g_dir_cursor = 0;
+    g_dir_open   = 1;
+    return 0;
 }
 
 int sofs_readdir(SOFS_DIRENT *dentry)
 {
-    /* TODO: lê o próximo registro válido do diretório em *dentry e avança o
-     * ponteiro de entradas. Retorna valor diferente de zero ao fim do diretório. */
-    (void)dentry;
-    return -1;
+    unsigned int block_size;
+    unsigned int entries_per_block;
+    unsigned char *buf;
+    struct sofs_record *records;
+    struct sofs_inode inode;
+    unsigned int i;
+
+    if (!g_mounted || !g_dir_open || dentry == NULL)
+        return -1;
+
+    block_size = g_superbloco.blockSize * SECTOR_SIZE;
+    entries_per_block = block_size / sizeof(struct sofs_record);
+    buf = (unsigned char *)__builtin_alloca(block_size);
+    if (read_block(get_root_dir_block(), buf) != 0)
+        return -1;
+
+    records = (struct sofs_record *)buf;
+    for (i = g_dir_cursor; i < entries_per_block; i++) {
+        if (records[i].TypeVal != TYPEVAL_INVALIDO) {
+            strncpy(dentry->name, records[i].name, SOFS_MAX_FILE_NAME_SIZE);
+            dentry->name[SOFS_MAX_FILE_NAME_SIZE] = '\0';
+            dentry->fileType = records[i].TypeVal;
+            if (read_inode(records[i].inodeNumber, &inode) == 0)
+                dentry->fileSize = inode.bytesFileSize;
+            else
+                dentry->fileSize = 0;
+            g_dir_cursor = i + 1;
+            return 0;
+        }
+    }
+
+    return 1; /* end of directory */
 }
 
 int sofs_closedir(void)
 {
-    /* TODO: reinicia o ponteiro de entradas do diretório e retorna 0. */
-    return -1;
+    g_dir_cursor = 0;
+    g_dir_open   = 0;
+    return 0;
 }
 
 /* -------------------------------------------------------------------------
