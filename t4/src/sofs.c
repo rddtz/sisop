@@ -306,10 +306,7 @@ static int set_directory_entry(const char *name, unsigned int inode_num,
     return -1;
 }
 
-/*
- * free_all_blocks - frees every data block and every index block reachable
- * from the given in-memory inode, then zeroes all block pointer fields.
- */
+// Free everything the inode points to and then the pointers
 static void free_all_blocks(struct sofs_inode *inode)
 {
     unsigned int block_size;
@@ -457,22 +454,7 @@ static int write_inode(unsigned int inode_num, const struct sofs_inode *inode)
     return write_block(inode_block, buf);
 }
 
-/*
- * map_block - maps a logical block index to a physical (absolute) block number.
- *
- *   inode         : in-memory inode (may be updated when allocate == 1)
- *   logical_index : zero-based logical block number within the file
- *   allocate      : 1 = allocate missing blocks; 0 = read-only lookup
- *   phys          : receives the physical block number (0 = hole / unallocated)
- *
- * Block layout:
- *   0..1                        direct (dataPtr[0], dataPtr[1])
- *   2..2+ppb-1                  single indirect (singleIndPtr)
- *   2+ppb..2+ppb+ppb*ppb-1     double indirect (doubleIndPtr)
- *
- * Returns 0 on success, -1 on error or capacity exceeded.
- * When allocate == 1 the caller must write_inode() after map_block() returns.
- */
+// convert logical block to real block on disk
 static int map_block(struct sofs_inode *inode, DWORD logical_index,
                      int allocate, unsigned int *phys)
 {
@@ -486,7 +468,7 @@ static int map_block(struct sofs_inode *inode, DWORD logical_index,
     block_size = g_superbloco.blockSize * SECTOR_SIZE;
     ppb = block_size / sizeof(DWORD);
 
-    /* --- direct blocks --- */
+    // direct pointers
     if (logical_index < 2) {
         if (inode->dataPtr[logical_index] == 0) {
             if (!allocate) {
@@ -503,7 +485,7 @@ static int map_block(struct sofs_inode *inode, DWORD logical_index,
     }
     logical_index -= 2;
 
-    /* --- single indirect --- */
+    // single indirection
     if (logical_index < ppb) {
         unsigned int *ind_buf = (unsigned int *)__builtin_alloca(block_size);
 
@@ -542,7 +524,7 @@ static int map_block(struct sofs_inode *inode, DWORD logical_index,
     }
     logical_index -= ppb;
 
-    /* --- double indirect --- */
+    // double indirection
     if (logical_index < ppb * ppb) {
         unsigned int outer = logical_index / ppb;
         unsigned int inner = logical_index % ppb;
@@ -605,7 +587,7 @@ static int map_block(struct sofs_inode *inode, DWORD logical_index,
         return 0;
     }
 
-    /* beyond max addressable capacity */
+    // file is too big, nothing maps here
     return -1;
 }
 
@@ -656,8 +638,7 @@ static int find_free_handle(void)
 
 int sofs_identify(char *name, int size)
 {
-    /* TODO: substituir pelos nomes e cartoes dos integrantes do grupo */
-    const char *id = "PREENCHER NOMES E CARTOES DO GRUPO";
+    const char *id = "Rayan Raddatz de Matos 00584919, Ana Luiza Colombi Sanfelice 00577504";
     if (name == NULL || size <= 0)
         return -1;
     strncpy(name, id, size - 1);
@@ -849,14 +830,14 @@ int sofs_delete(char *name)
         return -1;
 
     if (inode.RefCounter > 1) {
-        /* other hardlinks still reference this inode; just decrement */
+        // someone else still links here, just drop the count
         inode.RefCounter--;
         if (write_inode(inode_num, &inode) != 0)
             return -1;
         return invalidate_directory_entry(name);
     }
 
-    /* last reference: release all blocks and the inode itself */
+    // last pointer, so we can delete now
     free_all_blocks(&inode);
 
     if (free_inode(inode_num) != 0)
@@ -1209,7 +1190,7 @@ int sofs_hln(char *linkname, char *filename)
         return -1;
 
     if (set_directory_entry(linkname, target_inode, TYPEVAL_REGULAR, NULL) != 0) {
-        /* rollback RefCounter increment */
+        // failed, decrement the previous increment because it would be wrong
         if (read_inode(target_inode, &inode) == 0) {
             inode.RefCounter--;
             write_inode(target_inode, &inode);
